@@ -20,64 +20,6 @@
 #include "glsl/spirv.h"
 #include "../cache.h"
 
-// --- Diagnostic dump helpers for shader crash debugging ---
-#include <stdio.h>
-#include <stdlib.h>
-
-#ifdef _WIN32
-#include <windows.h>
-#include <direct.h>
-#endif
-
-static int pl_diag_pass_counter = 0;
-static int pl_diag_run_counter = 0;
-static char pl_diag_dir[512] = {0};
-
-static const char *pl_diag_get_dir(void)
-{
-    if (pl_diag_dir[0])
-        return pl_diag_dir;
-#ifdef _WIN32
-    const char *tmp = getenv("TEMP");
-    if (!tmp) tmp = getenv("TMP");
-    if (!tmp) tmp = "C:\\Temp";
-    snprintf(pl_diag_dir, sizeof(pl_diag_dir), "%s\\pl_debug", tmp);
-    CreateDirectoryA(pl_diag_dir, NULL);
-#else
-    snprintf(pl_diag_dir, sizeof(pl_diag_dir), "/tmp/pl_debug");
-    (void)mkdir(pl_diag_dir, 0755);
-#endif
-    return pl_diag_dir;
-}
-
-static void pl_diag_dump(const char *filename, const char *content)
-{
-    if (!content)
-        return;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", pl_diag_get_dir(), filename);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fputs(content, f);
-        fclose(f);
-    }
-}
-
-static void pl_diag_dump_fmt(const char *filename, const char *fmt, ...)
-{
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", pl_diag_get_dir(), filename);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        va_list ap;
-        va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        va_end(ap);
-        fclose(f);
-    }
-}
-// --- End diagnostic dump helpers ---
-
 struct stream_buf_slice {
     const void *data;
     unsigned int size;
@@ -538,19 +480,6 @@ static ID3DBlob *shader_compile_glsl(pl_gpu gpu, pl_pass pass,
     pl_log_cpu_time(gpu->log, after_spvc, pl_clock_now(), "translating HLSL to DXBC");
 
 error:;
-    // --- Diagnostic: dump GLSL and HLSL to files ---
-    {
-        int id = pl_diag_pass_counter++;
-        char fname[128];
-        snprintf(fname, sizeof(fname), "pass_%04d_%s.glsl", id, shader_names[stage]);
-        pl_diag_dump(fname, glsl);
-        if (hlsl) {
-            snprintf(fname, sizeof(fname), "pass_%04d_%s.hlsl", id, shader_names[stage]);
-            pl_diag_dump(fname, hlsl);
-        }
-    }
-    // --- End diagnostic ---
-
     if (hlsl) {
         int level = out ? PL_LOG_DEBUG : PL_LOG_ERR;
         PL_MSG(gpu, level, "%s shader HLSL source:", shader_names[stage]);
@@ -810,43 +739,6 @@ static bool pass_create_raster(pl_gpu gpu, struct pl_pass_t *pass,
     }
     D3D(ID3D11Device_CreateInputLayout(p->dev, in_descs,
         params->num_vertex_attribs, vs_str.buf, vs_str.len, &pass_p->layout));
-
-    // --- Diagnostic: dump input layout and pass info ---
-    {
-        static int raster_pass_id = 0;
-        int id = raster_pass_id++;
-        char fname[128];
-        snprintf(fname, sizeof(fname), "raster_pass_%04d_layout.txt", id);
-
-        char buf[4096];
-        int off = 0;
-        off += snprintf(buf + off, sizeof(buf) - off,
-            "raster_pass_id: %d\n"
-            "num_vertex_attribs: %d\n"
-            "vertex_stride: %zu\n"
-            "glsl_shader (first 200 chars): %.200s\n"
-            "vertex_shader (first 200 chars): %.200s\n\n",
-            id,
-            params->num_vertex_attribs,
-            params->vertex_stride,
-            params->glsl_shader ? params->glsl_shader : "(null)",
-            params->vertex_shader ? params->vertex_shader : "(null)");
-
-        for (int i = 0; i < params->num_vertex_attribs && off < (int)sizeof(buf) - 256; i++) {
-            off += snprintf(buf + off, sizeof(buf) - off,
-                "  attrib[%d]: semantic=%s%d format=%d offset=%d location=%d components=%d\n",
-                i,
-                in_descs[i].SemanticName,
-                in_descs[i].SemanticIndex,
-                (int)in_descs[i].Format,
-                in_descs[i].AlignedByteOffset,
-                params->vertex_attribs[i].location,
-                params->vertex_attribs[i].fmt->num_components);
-        }
-
-        pl_diag_dump(fname, buf);
-    }
-    // --- End diagnostic ---
 
     static const D3D11_BLEND blend_options[] = {
         [PL_BLEND_ZERO] = D3D11_BLEND_ZERO,
@@ -1277,43 +1169,6 @@ static void pass_run_raster(pl_gpu gpu, const struct pl_pass_run_params *params)
     } else {
         ID3D11DeviceContext_Draw(p->imm, params->vertex_count, 0);
     }
-
-    // --- Diagnostic: log every draw call and dump details on error ---
-    {
-        int run_id = pl_diag_run_counter++;
-        // Always write last draw info (ring buffer of 1) so we know which draw crashed
-        pl_diag_dump_fmt("last_draw.txt",
-            "run_id: %d\n"
-            "pass_type: raster\n"
-            "vertex_count: %d\n"
-            "num_attribs: %d\n"
-            "vertex_stride: %zu\n"
-            "vs: %p\n"
-            "ps: %p\n"
-            "layout: %p\n"
-            "target: %dx%d\n"
-            "viewport: %d,%d - %d,%d\n"
-            "scissors: %d,%d - %d,%d\n"
-            "vertex.cbvs: %d  vertex.srvs: %d  vertex.samplers: %d\n"
-            "main.cbvs: %d  main.srvs: %d  main.samplers: %d\n"
-            "uavs: %d\n",
-            run_id,
-            params->vertex_count,
-            pass->params.num_vertex_attribs,
-            pass->params.vertex_stride,
-            (void*)pass_p->vs,
-            (void*)pass_p->ps,
-            (void*)pass_p->layout,
-            params->target->params.w, params->target->params.h,
-            params->viewport.x0, params->viewport.y0,
-            params->viewport.x1, params->viewport.y1,
-            params->scissors.x0, params->scissors.y0,
-            params->scissors.x1, params->scissors.y1,
-            pass_p->vertex.cbvs.num, pass_p->vertex.srvs.num, pass_p->vertex.samplers.num,
-            pass_p->main.cbvs.num, pass_p->main.srvs.num, pass_p->main.samplers.num,
-            pass_p->uavs.num);
-    }
-    // --- End diagnostic ---
 
     // Unbind everything. It's easier to do this than to actually track state,
     // and if we leave the RTV bound, it could trip up D3D's conflict checker.
